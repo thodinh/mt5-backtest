@@ -1,0 +1,123 @@
+name: 'MT5 Backtest'
+description: 'Run a MetaTrader 5 strategy-tester backtest on a headless Wine container and return the report'
+branding:
+  icon: 'bar-chart-2'
+  color: 'blue'
+
+inputs:
+  ea:
+    description: 'Path to the compiled .ex5 Expert Advisor'
+    required: true
+  symbol:
+    description: 'Trading symbol (broker-specific, e.g. BTCUSDm on Exness)'
+    required: false
+    default: 'BTCUSDm'
+  period:
+    description: 'Timeframe (M1, M5, M15, H1, ...)'
+    required: false
+    default: 'M1'
+  from:
+    description: 'Start date (YYYY.MM.DD)'
+    required: true
+  to:
+    description: 'End date (YYYY.MM.DD)'
+    required: true
+  deposit:
+    description: 'Initial deposit'
+    required: false
+    default: '100000'
+  currency:
+    description: 'Deposit currency'
+    required: false
+    default: 'USD'
+  model:
+    description: 'Test model (0 = every tick, 1 = 1-minute OHLC, ...)'
+    required: false
+    default: '0'
+  set:
+    description: 'Path to a UTF-16LE .set preset'
+    required: false
+    default: ''
+  mt5-login:
+    description: 'MT5 account login'
+    required: true
+  mt5-password:
+    description: 'MT5 account password'
+    required: true
+  mt5-server:
+    description: 'MT5 broker server'
+    required: true
+  require-deals:
+    description: 'Fail if zero deals were performed'
+    required: false
+    default: 'false'
+
+outputs:
+  report:
+    description: 'Path to the Markdown report'
+    value: ${{ steps.backtest.outputs.report }}
+  balance:
+    description: 'Final balance'
+    value: ${{ steps.backtest.outputs.balance }}
+  deals:
+    description: 'Total deals'
+    value: ${{ steps.backtest.outputs.deals }}
+  passed:
+    description: '"yes" if the test passed'
+    value: ${{ steps.backtest.outputs.passed }}
+
+runs:
+  using: 'composite'
+  steps:
+    - uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: latest
+
+    - name: Install mt5cli
+      shell: bash
+      run: bun install -g mt5cli@2.2.1
+
+    - name: Run backtest
+      id: backtest
+      shell: bash
+      env:
+        MT5_LOGIN: ${{ inputs.mt5-login }}
+        MT5_PASSWORD: ${{ inputs.mt5-password }}
+        MT5_SERVER: ${{ inputs.mt5-server }}
+      run: |
+        mkdir -p "$HOME/.mt5/profiles"
+        printf 'MT5_RUNTIME=docker\nMT5_IMAGE=ghcr.io/thodinh/mt5-exness:b6122\nMT5_LOGIN=%s\nMT5_PASSWORD=%s\nMT5_SERVER=%s\nMT5_DEFAULT_SYMBOL=%s\n' \
+          "$MT5_LOGIN" "$MT5_PASSWORD" "$MT5_SERVER" "${{ inputs.symbol }}" > "$HOME/.mt5/profiles/default.env"
+
+        SET_ARG=""
+        [ -n "${{ inputs.set }}" ] && SET_ARG="--set ${{ inputs.set }}"
+
+        mt5 backtest "${{ inputs.ea }}" \
+          --symbol "${{ inputs.symbol }}" \
+          --period "${{ inputs.period }}" \
+          --from "${{ inputs.from }}" \
+          --to "${{ inputs.to }}" \
+          --deposit "${{ inputs.deposit }}" \
+          --currency "${{ inputs.currency }}" \
+          --model "${{ inputs.model }}" \
+          $SET_ARG \
+          --out mt5-reports 2>&1 | tee /tmp/mt5-backtest.log
+
+        REPORT=$(grep -oP 'report: \K.*' /tmp/mt5-backtest.log | tail -1)
+        BALANCE=$(grep -oP 'final balance: \K.*' /tmp/mt5-backtest.log | tail -1)
+        DEALS=$(grep -oP 'total deals: \K.*' /tmp/mt5-backtest.log | tail -1)
+        PASSED=$(grep -oP 'test passed: \K.*' /tmp/mt5-backtest.log | tail -1)
+
+        echo "report=$REPORT" >> "$GITHUB_OUTPUT"
+        echo "balance=$BALANCE" >> "$GITHUB_OUTPUT"
+        echo "deals=$DEALS" >> "$GITHUB_OUTPUT"
+        echo "passed=$PASSED" >> "$GITHUB_OUTPUT"
+
+        if [ "$PASSED" != "yes" ]; then
+          echo "::error::backtest did not pass (final balance=${BALANCE:-N/A}, deals=${DEALS:-0})"
+          exit 1
+        fi
+        if [ "${{ inputs.require-deals }}" = "true" ] && [ "${DEALS:-0}" -le 0 ]; then
+          echo "::error::backtest performed 0 deals"
+          exit 1
+        fi
